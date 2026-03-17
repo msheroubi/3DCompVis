@@ -961,12 +961,16 @@ def _score_information_gain(
     unvisited: list[int],
     fov_half_angle: float = 0.52,   # ~30° half-angle ≈ 60° full FOV
     max_range: float = 0.5,         # max viewing distance in metres
+    scene_center: np.ndarray | None = None,
 ) -> np.ndarray:
     """Score each unvisited candidate by UNKNOWN voxels in its view frustum.
 
     Uses a simplified cone test: a voxel is "visible" if it falls within
     *fov_half_angle* of the camera's viewing direction and is closer than
     *max_range*.
+
+    When *scene_center* is provided, viewpoints closer to the scene centre
+    receive a proximity bonus (1 / (1 + dist)).
     """
     unk_ijk = np.argwhere(occupancy == UNKNOWN)
     if len(unk_ijk) == 0:
@@ -994,6 +998,12 @@ def _score_information_gain(
         cos_angles = to_voxel_norm @ d
         in_view = valid & (cos_angles > cos_thresh) & (dists < max_range)
         scores[i] = float(in_view.sum())
+
+    # Proximity bonus: viewpoints closer to scene centre score higher
+    if scene_center is not None:
+        for i, vi in enumerate(unvisited):
+            d_cam = np.linalg.norm(cam_positions[vi] - scene_center)
+            scores[i] *= 1.0 / (1.0 + d_cam)
 
     return scores
 
@@ -1045,6 +1055,7 @@ def _select_next_viewpoints(
     candidates: list[list[float]],
     current_joints: np.ndarray | None,
     n_select: int = 3,
+    scene_center: np.ndarray | None = None,
 ) -> list[int]:
     """Smart viewpoint selection: information-gain + NBV matching + TSP.
 
@@ -1067,6 +1078,7 @@ def _select_next_viewpoints(
             cam_positions, cam_directions,
             occupancy, grid_origin, voxel_size,
             unvisited,
+            scene_center=scene_center,
         )
     else:
         ig_scores = np.ones(len(unvisited))  # uniform fallback
@@ -1213,6 +1225,84 @@ async def auto_nbv_explore(
         live_vis = LiveVisualizer(port=getattr(args, "viser_port", 8080))
         live_vis.start()
 
+    # ── Initialise scene bounds from a forward-looking reference pose ─────
+    # We use the first DEFAULT_VIEWPOINT (a known good forward-looking
+    # pose) rather than the rest position, which points at the ceiling.
+    scene_center: np.ndarray | None = None
+    scene_forward: np.ndarray | None = None
+    REFERENCE_VIEWPOINT = DEFAULT_VIEWPOINTS[0]  # [0, -30, 60, -30, 0, 50]
+
+    if _HAS_FK:
+        # Move arm to the reference viewpoint first
+        print("[scene] Moving to reference viewpoint for scene initialisation...")
+        move_arm(robot, REFERENCE_VIEWPOINT)
+        time.sleep(0.5)
+
+        ref_joints = np.array(REFERENCE_VIEWPOINT, dtype=float)
+        T_c2w = ee_pose(ref_joints)  # 4×4 camera-to-world
+        cam_pos = T_c2w[:3, 3].copy()
+        # The FK z-axis points *away* from the scene (robotics convention).
+        # Negate it to get the optical axis pointing *into* the scene.
+        cam_fwd = -T_c2w[:3, 2].copy()   # negated z-axis = into scene
+        cam_fwd /= np.linalg.norm(cam_fwd) + 1e-12
+
+        # Place the scene centre well in front of the camera, where the
+        # object actually is.
+        SCENE_OFFSET_M = 0.25   # 25 cm along the viewing direction
+        scene_center = cam_pos + cam_fwd * SCENE_OFFSET_M
+        scene_forward = cam_fwd.copy()
+
+        half_ext = getattr(args, "scene_extent", 2.4)
+        bounds_type = getattr(args, "bounds_type", "hemisphere")
+        print(f"[scene] Initialising fixed scene bounds:")
+        print(f"  cam_pos = {cam_pos.tolist()}")
+        print(f"  center  = {scene_center.tolist()}  (offset {SCENE_OFFSET_M}m forward)")
+        print(f"  forward = {scene_forward.tolist()}")
+        print(f"  extent  = {half_ext} m  ({bounds_type})")
+
+        try:
+            init_url = base.rstrip("/") + "/scene/init"
+            r = requests.post(init_url, timeout=30, json={
+                "center": scene_center.tolist(),
+                "forward": scene_forward.tolist(),
+                "half_extent": half_ext,
+                "bounds_type": bounds_type,
+            })
+            r.raise_for_status()
+            print(f"  Server response: {r.json()}")
+        except Exception as e:
+            print(f"  WARNING: /scene/init failed: {e}")
+    else:
+        print("[scene] FK not available — using dynamic bounds (no fixed scene)")
+
+    # ── Capture reference frame at the forward-looking pose ───────────
+    # This first frame anchors the VGGT reconstruction with a good view
+    # of the scene (instead of the folded rest position).
+    print("[reference] Capturing reference frame at forward-looking position ...")
+    try:
+        resp = api(base, "/session/start", "POST",
+                   params={"max_frames": 5, "min_baseline_m": 0.0})
+        ref_sid = resp["session_id"]
+        async with websockets.connect(ws_url(base), max_size=2**24) as ws:
+            import orjson as _orjson
+            obs = robot.get_observation()
+            frame = obs.get("wrist_cam")
+            if frame is not None:
+                frame = _process_frame(frame, args)
+                joint_deg = read_joint_positions(robot)
+                pose = joint_to_pose7(joint_deg)
+                jpeg_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(args.jpeg_quality)]
+                ok, encoded = cv2.imencode(".jpg", frame, jpeg_params)
+                if ok:
+                    await ws.send(encode_message(encoded.tobytes(), pose))
+                    _payload = _orjson.loads(await ws.recv())
+                    coll = _payload.get("collection", {})
+                    print(f"  Reference frame: {'accepted' if coll.get('frame_accepted') else 'skipped'}")
+        api(base, "/session/stop", "POST")
+        print(f"  Reference session {ref_sid} stored")
+    except Exception as e:
+        print(f"  WARNING: reference frame capture failed: {e}")
+
     # Build candidate bank — dense sampling for better exploration coverage
     if args.viewpoints_json:
         with open(args.viewpoints_json) as f:
@@ -1228,12 +1318,24 @@ async def auto_nbv_explore(
     visited: set[int] = set()
     round_n = 0
 
-    # Seed batch: farthest-point sampling for spatially diverse initial views
-    if _HAS_FK and len(candidates) > args.seed_views:
-        next_batch: list[int] = _farthest_point_seed(
-            cam_positions, args.seed_views)
+    # Seed batch: use the first N DEFAULT_VIEWPOINTS (forward-looking)
+    # rather than FPS (which picks extreme positions all over the workspace).
+    n_defaults = len(DEFAULT_VIEWPOINTS)
+    seed_count = min(args.seed_views, len(candidates))
+    if seed_count <= n_defaults:
+        # All seed views come from the hand-tuned forward-looking defaults
+        next_batch = list(range(seed_count))
     else:
-        next_batch = list(range(min(args.seed_views, len(candidates))))
+        # Start with all defaults, then FPS fill from the rest
+        next_batch = list(range(n_defaults))
+        remaining = seed_count - n_defaults
+        other_indices = [i for i in range(n_defaults, len(candidates))]
+        if _HAS_FK and remaining > 0 and len(other_indices) > remaining:
+            extra = _farthest_point_seed(
+                cam_positions[other_indices], remaining)
+            next_batch.extend([other_indices[e] for e in extra])
+        else:
+            next_batch.extend(other_indices[:remaining])
 
     while round_n < args.max_rounds and next_batch:
         round_n += 1
@@ -1307,6 +1409,7 @@ async def auto_nbv_explore(
             candidates=candidates,
             current_joints=current_joints,
             n_select=args.views_per_round,
+            scene_center=scene_center,
         )
         print(f"  Selected next batch: {next_batch} "
               f"(info-gain + NBV + TSP from {len(unvisited)} candidates)")
@@ -1444,6 +1547,15 @@ def parse_args() -> argparse.Namespace:
                    help="Dense viewpoint bank size for auto exploration (default: 200)")
     p.add_argument("--viewpoints-json", default=None,
                    help="Custom viewpoints file (auto mode, overrides --bank-size)")
+
+    # Scene bounds
+    p.add_argument("--scene-extent", type=float, default=2.4,
+                   help="Half side-length (cube) or radius (hemisphere) of the fixed "
+                        "scene bounding volume in metres (default: 2.4)")
+    p.add_argument("--bounds-type", choices=["hemisphere", "cube"],
+                   default="hemisphere",
+                   help="Type of fixed bounding volume: 'hemisphere' (default, "
+                        "forward half only) or 'cube' (full axis-aligned box)")
 
     # Live viser visualization
     p.add_argument("--live-viser", action="store_true",

@@ -156,10 +156,30 @@ class VGGTReconstructor:
 
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def reconstruct(self, bgr_frames: list[np.ndarray]) -> ReconstructionResult:
+    def reconstruct(
+        self,
+        bgr_frames: list[np.ndarray],
+        scene_bounds: tuple[np.ndarray, np.ndarray] | None = None,
+        scene_bounds_type: str = "hemisphere",
+        scene_forward: np.ndarray | None = None,
+        scene_center: np.ndarray | None = None,
+    ) -> ReconstructionResult:
         """Run full reconstruction on a list of BGR frames.
 
-        Returns a ReconstructionResult with all geometry + uncertainty.
+        Parameters
+        ----------
+        scene_bounds : (lo, hi) each (3,)
+            If provided, the voxel grid uses this fixed axis-aligned box
+            instead of computing bounds from the point cloud.  This keeps
+            ``voxel_size`` constant across rounds.
+        scene_bounds_type : str
+            ``"cube"`` — use the full AABB.  ``"hemisphere"`` (default) —
+            additionally discard points behind ``scene_center`` relative
+            to ``scene_forward``.
+        scene_forward : (3,) unit vector
+            Forward direction for hemisphere clipping.
+        scene_center : (3,)
+            Centre point for hemisphere clipping.
         """
         self.load_model()
         t0 = time.perf_counter()
@@ -207,13 +227,20 @@ class VGGTReconstructor:
 
         # ---- Voxelise uncertainty ---------------------------------------
         voxel_unc, voxel_origin, voxel_size = self._voxelise_uncertainty(
-            fused_xyz, fused_conf
+            fused_xyz, fused_conf,
+            scene_bounds=scene_bounds,
+            scene_bounds_type=scene_bounds_type,
+            scene_forward=scene_forward,
+            scene_center=scene_center,
         )
 
         # ---- Occupancy grid via ray‑casting -----------------------------
         voxel_occ = self._build_occupancy_grid(
             extr, intr, world_pts, world_conf,
             voxel_origin, voxel_size,
+            scene_bounds_type=scene_bounds_type,
+            scene_center=scene_center,
+            scene_forward=scene_forward,
         )
 
         dt = time.perf_counter() - t0
@@ -275,24 +302,66 @@ class VGGTReconstructor:
         self,
         xyz: np.ndarray,   # (N, 3)
         conf: np.ndarray,  # (N,)
+        scene_bounds: tuple[np.ndarray, np.ndarray] | None = None,
+        scene_bounds_type: str = "hemisphere",
+        scene_forward: np.ndarray | None = None,
+        scene_center: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         """Build a voxel grid of mean *inverse* confidence (= uncertainty).
+
+        When *scene_bounds* is provided the grid is locked to that fixed
+        axis-aligned box.  Points outside the box are discarded.  For
+        ``scene_bounds_type="hemisphere"`` points behind the centre
+        (relative to ``scene_forward``) are also discarded.
 
         Voxels with no observations get maximum uncertainty (1.0).
         Returns (grid, origin, voxel_size).
         """
         G = self.voxel_resolution
         if len(xyz) == 0:
+            if scene_bounds is not None:
+                lo, hi = scene_bounds
+                origin = lo.copy()
+                span = hi - lo
+                voxel_size = float(span.max() / G)
+                return np.ones((G, G, G), dtype=np.float32), origin.astype(np.float32), voxel_size
             return np.ones((G, G, G), dtype=np.float32), np.zeros(3), 1.0
 
-        lo = xyz.min(axis=0)
-        hi = xyz.max(axis=0)
-        extent = hi - lo
-        # add a 5 % border so edge points aren't on voxel boundaries
-        margin = extent * 0.05 + 1e-6
-        origin = lo - margin
-        span = extent + 2 * margin
-        voxel_size = float(span.max() / G)
+        if scene_bounds is not None:
+            lo_b, hi_b = scene_bounds[0].astype(np.float64), scene_bounds[1].astype(np.float64)
+
+            # ── Clip points to the bounding box ──
+            inside = np.all((xyz >= lo_b) & (xyz <= hi_b), axis=1)
+
+            # ── Hemisphere mode: also discard behind centre ──
+            if scene_bounds_type == "hemisphere" and scene_center is not None:
+                fwd = scene_forward if scene_forward is not None else np.array([1.0, 0.0, 0.0])
+                fwd = fwd / (np.linalg.norm(fwd) + 1e-12)
+                # signed distance along forward axis from scene_center
+                signed = (xyz - scene_center) @ fwd
+                inside = inside & (signed >= -0.02)  # 2 cm tolerance
+
+            xyz = xyz[inside]
+            conf = conf[inside]
+
+            origin = lo_b.copy()
+            span = hi_b - lo_b
+            voxel_size = float(span.max() / G)
+
+            logger.info("Fixed bounds voxelisation (%s): %d pts inside, "
+                        "voxel_size=%.4f m", scene_bounds_type, len(xyz), voxel_size)
+        else:
+            # ── Dynamic bounds (original behaviour) ──
+            lo = xyz.min(axis=0)
+            hi = xyz.max(axis=0)
+            extent = hi - lo
+            margin = extent * 0.05 + 1e-6
+            origin = lo - margin
+            span = extent + 2 * margin
+            voxel_size = float(span.max() / G)
+
+        if len(xyz) == 0:
+            return np.ones((G, G, G), dtype=np.float32), origin.astype(np.float32), voxel_size
 
         # quantise each point to a voxel
         idx = ((xyz - origin) / voxel_size).astype(np.int32)
@@ -310,6 +379,21 @@ class VGGTReconstructor:
         with np.errstate(divide="ignore", invalid="ignore"):
             unc = np.where(count_grid > 0, sum_grid / count_grid, 1.0).astype(np.float32)
 
+        # Mark voxels outside the hemisphere with zero uncertainty
+        # so the planner never targets them.
+        if scene_bounds_type == "hemisphere" and scene_center is not None:
+            fwd = scene_forward if scene_forward is not None else np.array([1.0, 0.0, 0.0])
+            fwd = fwd / (np.linalg.norm(fwd) + 1e-12)
+            ii, jj, kk = np.meshgrid(
+                np.arange(G), np.arange(G), np.arange(G), indexing="ij"
+            )
+            voxel_centres = origin.astype(np.float64) + (np.stack([ii, jj, kk], axis=-1) + 0.5) * voxel_size
+            signed = np.einsum("...j,j->...", voxel_centres - scene_center, fwd)
+            dist_to_c = np.linalg.norm(voxel_centres - scene_center, axis=-1)
+            half_ext = 0.5 * G * voxel_size
+            outside = (signed < -0.02) | (dist_to_c > half_ext)
+            unc[outside] = 0.0
+
         return unc, origin.astype(np.float32), voxel_size
 
     # ------------------------------------------------------------------
@@ -322,6 +406,9 @@ class VGGTReconstructor:
         voxel_origin: np.ndarray,      # (3,)
         voxel_size: float,
         ray_stride: int = 4,
+        scene_bounds_type: str = "hemisphere",
+        scene_center: np.ndarray | None = None,
+        scene_forward: np.ndarray | None = None,
     ) -> np.ndarray:
         """Build a tri‑state occupancy grid via 3D DDA ray‑casting.
 
@@ -331,6 +418,10 @@ class VGGTReconstructor:
         the surface voxel is marked OCCUPIED.  Unvisited voxels remain
         UNKNOWN.
 
+        When ``scene_bounds_type="hemisphere"`` voxels behind
+        ``scene_center`` (relative to ``scene_forward``) are
+        pre‑marked FREE so they are excluded from frontier detection.
+
         Returns
         -------
         grid : np.ndarray, dtype=uint8, shape (G, G, G)
@@ -338,6 +429,28 @@ class VGGTReconstructor:
         """
         G = self.voxel_resolution
         grid = np.zeros((G, G, G), dtype=np.uint8)  # UNKNOWN = 0
+
+        # ── Pre-mark voxels outside the hemisphere as FREE ──────────────
+        if scene_bounds_type == "hemisphere" and scene_center is not None:
+            fwd = scene_forward if scene_forward is not None else np.array([1.0, 0.0, 0.0])
+            fwd = fwd / (np.linalg.norm(fwd) + 1e-12)
+            # Build (G, G, G, 3) array of voxel centre world coordinates
+            ii, jj, kk = np.meshgrid(
+                np.arange(G), np.arange(G), np.arange(G), indexing="ij"
+            )
+            voxel_centres = voxel_origin + (np.stack([ii, jj, kk], axis=-1) + 0.5) * voxel_size
+            # signed distance along forward axis
+            signed = np.einsum("...j,j->...", voxel_centres - scene_center, fwd)
+            outside_hemisphere = signed < -0.02  # 2 cm tolerance
+            # Also mark voxels outside the sphere of radius = half_extent
+            dist_to_center = np.linalg.norm(voxel_centres - scene_center, axis=-1)
+            half_ext = 0.5 * G * voxel_size  # radius = half the grid span
+            outside_sphere = dist_to_center > half_ext
+            outside = outside_hemisphere | outside_sphere
+            grid[outside] = FREE
+            n_masked = int(outside.sum())
+            logger.info("Hemisphere mask: %d / %d voxels (%.1f%%) pre-marked FREE",
+                        n_masked, grid.size, 100.0 * n_masked / grid.size)
 
         S, H, W, _ = world_points.shape
 

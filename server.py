@@ -72,6 +72,13 @@ class ServerState:
         # Latest planned viewpoints
         self.planned_views: list[ViewpointCommand] = []
 
+        # Fixed scene bounds (set via /scene/init before exploration)
+        self.scene_center: Optional[np.ndarray] = None
+        self.scene_half_extent: float = 0.4          # metres
+        self.scene_bounds: Optional[tuple[np.ndarray, np.ndarray]] = None  # (lo, hi)
+        self.scene_bounds_type: str = "hemisphere"    # "hemisphere" | "cube"
+        self.scene_forward: Optional[np.ndarray] = None  # unit forward dir (for hemisphere)
+
 
 state: Optional[ServerState] = None
 
@@ -194,6 +201,95 @@ def session_status() -> JSONResponse:
     })
 
 
+@app.post("/reset")
+def reset_server() -> JSONResponse:
+    """Clear all sessions, reconstruction results, and scene bounds."""
+    assert state is not None
+    n_sessions = len(state.sessions.history)
+    state.sessions.history.clear()
+    state.sessions.active = None
+    state.reconstruction_result = None
+    state.reconstruction_error = None
+    state.planned_views = []
+    state.scene_center = None
+    state.scene_bounds = None
+    state.scene_forward = None
+    state.scene_bounds_type = "hemisphere"
+    logger.info("Server reset: cleared %d sessions", n_sessions)
+    return JSONResponse({"cleared_sessions": n_sessions, "status": "reset"})
+
+
+# ---- Scene initialisation ----
+
+from pydantic import BaseModel
+
+class SceneInitRequest(BaseModel):
+    center: list[float]                   # [x, y, z]
+    forward: list[float] | None = None    # [fx, fy, fz]
+    half_extent: float = 0.4
+    bounds_type: str = "hemisphere"        # "hemisphere" | "cube"
+
+
+@app.post("/scene/init")
+def scene_init(body: SceneInitRequest) -> JSONResponse:
+    """Set a fixed bounding volume for the scene.
+
+    JSON body fields
+    ----------------
+    center : [x, y, z]
+        Scene centre in world coordinates (usually the FK-derived camera
+        position at the arm's starting pose).
+    forward : [fx, fy, fz]
+        Unit forward direction the arm faces (used for hemisphere mode).
+    half_extent : float
+        Half side-length (cube) or radius (hemisphere) in metres.
+    bounds_type : str
+        ``"hemisphere"`` (default) — only the half-space in front of the
+        arm is included.  ``"cube"`` — full axis-aligned cube.
+    """
+    assert state is not None
+
+    # ── Clear all previous sessions and reconstruction results ──
+    state.sessions.history.clear()
+    state.sessions.active = None
+    state.reconstruction_result = None
+    state.reconstruction_error = None
+    state.planned_views = []
+    logger.info("Scene init: cleared %s previous sessions and reconstruction",
+                "all")
+
+    c = np.array(body.center, dtype=np.float64)
+    state.scene_center = c
+    state.scene_half_extent = body.half_extent
+    state.scene_bounds_type = body.bounds_type
+
+    if body.forward is not None:
+        fwd = np.array(body.forward, dtype=np.float64)
+        fwd_norm = np.linalg.norm(fwd)
+        state.scene_forward = fwd / fwd_norm if fwd_norm > 1e-8 else np.array([1.0, 0.0, 0.0])
+    else:
+        state.scene_forward = np.array([1.0, 0.0, 0.0])  # default
+
+    # Compute axis-aligned bounding box that encloses the chosen volume.
+    # For the hemisphere we still store a full cube as the grid bounds,
+    # but the is_inside callback will clip to the half-space at voxel level.
+    lo = c - body.half_extent
+    hi = c + body.half_extent
+    state.scene_bounds = (lo, hi)
+
+    logger.info("Scene init: center=%s, half_extent=%.3f, type=%s, forward=%s",
+                c.tolist(), body.half_extent, body.bounds_type,
+                state.scene_forward.tolist())
+    return JSONResponse({
+        "center": c.tolist(),
+        "half_extent": body.half_extent,
+        "bounds_type": body.bounds_type,
+        "forward": state.scene_forward.tolist(),
+        "bbox_lo": lo.tolist(),
+        "bbox_hi": hi.tolist(),
+    })
+
+
 # ---- Reconstruction ----
 
 def _run_reconstruction(session: CollectionSession) -> None:
@@ -207,7 +303,13 @@ def _run_reconstruction(session: CollectionSession) -> None:
         subset = session.select_subset(n=20)
         bgr_frames = [f.frame_bgr for f in subset]
 
-        result = state.reconstructor.reconstruct(bgr_frames)
+        result = state.reconstructor.reconstruct(
+            bgr_frames,
+            scene_bounds=state.scene_bounds,
+            scene_bounds_type=state.scene_bounds_type,
+            scene_forward=state.scene_forward,
+            scene_center=state.scene_center,
+        )
         state.reconstruction_result = result
 
         # Run planner immediately
@@ -218,6 +320,7 @@ def _run_reconstruction(session: CollectionSession) -> None:
             voxel_size=result.voxel_size,
             previous_poses=arm_poses,
             voxel_occupancy=result.voxel_occupancy,
+            arm_base_position=state.scene_center,
         )
 
         session.status = "done"
@@ -262,7 +365,13 @@ def _run_reconstruction_merged(sessions: list[CollectionSession]) -> None:
         logger.info("Merged reconstruction: %d sessions, %d total frames, "
                     "%d selected", len(sessions), len(all_frames), len(bgr_frames))
 
-        result = state.reconstructor.reconstruct(bgr_frames)
+        result = state.reconstructor.reconstruct(
+            bgr_frames,
+            scene_bounds=state.scene_bounds,
+            scene_bounds_type=state.scene_bounds_type,
+            scene_forward=state.scene_forward,
+            scene_center=state.scene_center,
+        )
         state.reconstruction_result = result
 
         # Run planner immediately
@@ -273,6 +382,7 @@ def _run_reconstruction_merged(sessions: list[CollectionSession]) -> None:
             voxel_size=result.voxel_size,
             previous_poses=arm_poses,
             voxel_occupancy=result.voxel_occupancy,
+            arm_base_position=state.scene_center,
         )
 
         for s in sessions:

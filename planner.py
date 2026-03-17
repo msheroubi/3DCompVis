@@ -42,6 +42,8 @@ class PlannerConfig:
     """How many viewpoints to propose per planning cycle."""
     view_distance_factor: float = 1.5
     """Multiplier on median scene radius for camera standoff distance."""
+    max_standoff_m: float = 0.5
+    """Hard upper limit on camera standoff (prevents unreachable poses)."""
     min_distance_between_views_m: float = 0.05
     """Don't propose two viewpoints closer than this."""
     up_vector: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, 1.0]))
@@ -63,6 +65,7 @@ class NextBestViewPlanner:
         previous_poses: list[ArmPose] | None = None,
         scene_center: np.ndarray | None = None,
         voxel_occupancy: np.ndarray | None = None,  # (Gx, Gy, Gz) uint8
+        arm_base_position: np.ndarray | None = None,  # (3,) for proximity weighting
     ) -> list[ViewpointCommand]:
         """Return a ranked list of viewpoint commands.
 
@@ -84,6 +87,7 @@ class NextBestViewPlanner:
                 voxel_occupancy, voxel_uncertainty,
                 voxel_origin, voxel_size,
                 k=self.cfg.n_viewpoints * 2,
+                arm_base_position=arm_base_position,
             )
             if len(centroids) > 0:
                 strategy = "frontier"
@@ -107,6 +111,7 @@ class NextBestViewPlanner:
 
         scene_radius = 0.5 * G * voxel_size
         standoff = scene_radius * self.cfg.view_distance_factor
+        standoff = min(standoff, self.cfg.max_standoff_m)  # clamp to reachable range
 
         # ---- 3. Generate candidate viewpoints ---------------------------
         prev_positions = (
@@ -212,14 +217,16 @@ class NextBestViewPlanner:
         origin: np.ndarray,
         voxel_size: float,
         k: int,
+        arm_base_position: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Find clusters of UNKNOWN voxels adjacent to FREE space (the frontier).
 
         Strategy:
-        1. Identify all UNKNOWN voxels that have at least one 6‑connected
+        1. Identify all UNKNOWN voxels that have at least one 6‐connected
            FREE neighbour.  These form the *exploration frontier*.
-        2. Rank them by uncertainty (high → low) and apply 26‑connected
-           non‑max suppression (same as ``_find_uncertain_clusters``).
+        2. Rank them by uncertainty weighted by proximity to the arm base
+           (closer voxels are prioritised) and apply 26‐connected
+           non‐max suppression.
         """
         G = occupancy.shape[0]
 
@@ -244,6 +251,16 @@ class NextBestViewPlanner:
 
         # Score each frontier voxel by its uncertainty
         scores = uncertainty[frontier]
+
+        # Proximity weighting: closer voxels to arm get higher scores
+        if arm_base_position is not None:
+            frontier_world = origin + (frontier_indices + 0.5) * voxel_size  # (M, 3)
+            dists_to_arm = np.linalg.norm(frontier_world - arm_base_position, axis=1)
+            proximity_weight = 1.0 / (1.0 + dists_to_arm)
+            scores = scores * proximity_weight
+            logger.debug("Frontier proximity weighting: min_dist=%.3f max_dist=%.3f",
+                         dists_to_arm.min(), dists_to_arm.max())
+
         order = np.argsort(scores)[::-1]
 
         selected_ijk: list[np.ndarray] = []
